@@ -21,6 +21,16 @@
 #include <haproxy/session.h>
 #include <haproxy/xprt_quic.h>
 
+
+#if defined(HA_QUIC_RAND_RECV)
+static THREAD_LOCAL struct {
+	uchar *buf;
+	ssize_t len;
+} rand_recv_buf[10];
+static THREAD_LOCAL int rand_recv_buf_idx;
+uint rand_recv_rate __read_mostly = 0;
+#endif
+
 /* This function is called from the protocol layer accept() in order to
  * instantiate a new session on behalf of a given listener and frontend. It
  * returns a positive value upon success, 0 if the connection can be ignored,
@@ -229,15 +239,55 @@ void quic_sock_fd_iocb(int fd)
 	}
 
 	dgram_buf = (unsigned char *)b_tail(buf);
+
+#if defined(HA_QUIC_RAND_RECV)
+	if (rand_recv_rate > 0) {
+		rand_recv_buf_idx++;
+		if (rand_recv_buf_idx >= sizeof(rand_recv_buf) / sizeof(*rand_recv_buf))
+			rand_recv_buf_idx = 0;
+		dgram_buf = rand_recv_buf[rand_recv_buf_idx].buf;
+	}
+#endif
+
 	saddrlen = sizeof saddr;
 	do {
 		ret = recvfrom(fd, dgram_buf, max_sz, 0,
 		               (struct sockaddr *)&saddr, &saddrlen);
-		if (ret < 0 && errno == EAGAIN) {
-			fd_cant_recv(fd);
-			goto out;
-		}
 	} while (ret < 0 && errno == EINTR);
+
+	if (ret < 0 && errno == EAGAIN)
+		fd_cant_recv(fd);
+
+#if defined(HA_QUIC_RAND_RECV)
+	rand_recv_buf[rand_recv_buf_idx].len = ret;
+
+	if (rand_recv_rate > 0) {
+		uchar *rcv_buf = dgram_buf; // where the data were received
+
+		/* let's switch back to the original target buffer */
+		dgram_buf = (unsigned char *)b_tail(buf);
+
+
+		if (statistical_prng_range(100) < rand_recv_rate) {
+			/* return a random buffer or nothing */
+			int idx = statistical_prng_range(sizeof(rand_recv_buf) / sizeof(*rand_recv_buf) - 1);
+			if (idx < 0) {
+				/* pretend we didn't receive anything */
+				goto out;
+			}
+			rcv_buf = rand_recv_buf[idx].buf;
+			ret     = rand_recv_buf[idx].len;
+		}
+
+		if (ret > 0) {
+			/* transfer what was received */
+			__b_putblk(buf, (char*)rcv_buf, ret);
+		}
+	}
+#endif
+
+	if (ret < 0 && errno == EAGAIN)
+		goto out;
 
 	b_add(buf, ret);
 	if (!quic_lstnr_dgram_dispatch(dgram_buf, ret, l, &saddr,
@@ -399,3 +449,43 @@ static int quic_deallocate_accept_queues(void)
 	return 1;
 }
 REGISTER_POST_DEINIT(quic_deallocate_accept_queues);
+
+
+#if defined(HA_QUIC_RAND_RECV)
+
+static int quic_set_rand_recv_rate(void)
+{
+	char *p = getenv("HA_QUIC_RAND_RECV_RATE");
+	if (p)
+		rand_recv_rate = atoi(p);
+	return 1;
+}
+
+REGISTER_POST_CHECK(quic_set_rand_recv_rate);
+
+/* allocates the random buffers; returns 0 on error, 1 on success */
+static int quic_alloc_recv_bufs_per_thread(void)
+{
+	int idx;
+
+	for (idx = 0; idx < sizeof(rand_recv_buf)/sizeof(*rand_recv_buf); idx++) {
+		rand_recv_buf[idx].buf = malloc(global.tune.bufsize);
+		if (!rand_recv_buf[idx].buf)
+			return 0;
+		rand_recv_buf[idx].len = 0;
+	}
+	return 1;
+}
+
+/* frees the random buffers */
+static void quic_free_recv_bufs_per_thread(void)
+{
+	int idx;
+
+	for (idx = 0; idx < sizeof(rand_recv_buf)/sizeof(*rand_recv_buf); idx++)
+		ha_free(&rand_recv_buf[idx].buf);
+}
+
+REGISTER_PER_THREAD_ALLOC(quic_alloc_recv_bufs_per_thread);
+REGISTER_PER_THREAD_FREE(quic_free_recv_bufs_per_thread);
+#endif // defined(HA_QUIC_RAND_RECV)
